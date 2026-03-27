@@ -1,0 +1,12 @@
+{
+    "autodeskProduct": "Fusion",
+    "type": "addin",
+    "id": "c3a7f1e2-8b4d-4e6a-9f0c-2d5e8a1b3c7f",
+    "author": "Bivy Works",
+    "description": {
+        "": "Quickly copy CAM template files into the current project folder and open them"
+    },
+    "version": "1.0.0",
+    "runOnStartup": true,
+    "supportedOS": "windows|mac"
+}
