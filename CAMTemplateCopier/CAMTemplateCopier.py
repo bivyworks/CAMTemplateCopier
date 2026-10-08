@@ -196,13 +196,7 @@ class DataFileCompleteHandler(adsk.core.DataEventHandler):
 
             if _source_data_file is not None:
                 try:
-                    design = adsk.fusion.Design.cast(new_doc.products.itemByProductType('DesignProductType'))
-                    if design:
-                        transform = adsk.core.Matrix3D.create()      # identity: at the origin
-                        design.rootComponent.occurrences.addByInsert(_source_data_file, transform, False)
-                        _log(f"Inserted '{_source_data_file.name}' into the new document.")
-                    else:
-                        _log('No design in the new document; the part was not inserted.')
+                    _insert_part(new_doc, _source_data_file)
                 except Exception:
                     error_msg = traceback.format_exc()
                     _log(f'Component insert failed:\n{error_msg}')
@@ -212,6 +206,39 @@ class DataFileCompleteHandler(adsk.core.DataEventHandler):
         finally:
             _pending_open_name = None
             _source_data_file = None
+
+
+def _insert_part(new_doc, data_file) -> None:
+    """Insert the part into the newly opened copy at the origin, as a linked
+    reference when configured (Occurrences.addByInsert with
+    isReferencedComponent=True; Fusion returns None when the two files are
+    not in the same project), else as an embedded copy."""
+    design = adsk.fusion.Design.cast(new_doc.products.itemByProductType('DesignProductType'))
+    if not design:
+        _log('No design in the new document; the part was not inserted.')
+        return
+    occurrences = design.rootComponent.occurrences
+    transform = adsk.core.Matrix3D.create()          # identity: at the origin
+    want_link = bool(getattr(config, 'INSERT_AS_REFERENCE', True))
+    occ = occurrences.addByInsert(data_file, transform, want_link) if want_link else None
+    if occ is not None:
+        linked = False
+        try:
+            linked = bool(occ.isReferencedComponent)
+        except Exception:
+            pass
+        _log(f"Inserted '{data_file.name}' as a {'linked reference' if linked else 'component'}.")
+        return
+    if want_link:
+        _log(f"Fusion refused to link '{data_file.name}' (the part and the copy must be in the same project); "
+             f"inserting an embedded copy instead.")
+    occ = occurrences.addByInsert(data_file, transform, False)
+    if occ is None:
+        raise RuntimeError(f"Occurrences.addByInsert returned None for '{data_file.name}'.")
+    _log(f"Inserted '{data_file.name}' as an embedded copy.")
+    if want_link:
+        _ui.messageBox(f'"{data_file.name}" was inserted as an embedded copy, not a linked reference: Fusion '
+                       f'only links files from the same project.')
 
 
 # ------------------------------------------------------------------ add-in lifecycle

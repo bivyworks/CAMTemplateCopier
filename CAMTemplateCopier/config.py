@@ -15,6 +15,14 @@ TEMPLATE_FOLDER_PATH = ["CAM Templates"]
 # name, e.g. "MFG Bracket" for a document named "Bracket".
 NEW_NAME_PREFIX = "MFG "
 
+# Insert the part into the copy as a linked reference (True), so that later
+# changes to the part flow into the manufacturing model, or as an embedded
+# copy (False). A link requires the part and the copy to be in the same
+# project, which is always the case here because the copy is saved into the
+# part's own folder; if Fusion still refuses the link, the add-in falls back
+# to an embedded copy and says so.
+INSERT_AS_REFERENCE = True
+
 # Add-in UI identifiers (no need to change these).
 ADDIN_COMMAND_ID = "CAMTemplateCopierCmd"
 ADDIN_COMMAND_NAME = "Copy CAM Template"
