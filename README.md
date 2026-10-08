@@ -16,7 +16,8 @@ add-in.
    *Insert this part into the template* ticked.
 4. The add-in saves a copy of the template into the same folder as `Bracket`,
    waits for the cloud upload to finish, opens the copy and inserts `Bracket`
-   at the origin as a component.
+   at the origin as a linked component, so later changes to `Bracket` flow
+   into the manufacturing model through Fusion's usual *Get Latest*.
 
 Nothing in the template or in the part is modified.
 
@@ -52,10 +53,13 @@ folder cannot be found name the setting to check.
 
 ## Notes
 
-- The part is inserted as an embedded copy, not as a linked reference. Edit
-  the `False` in the `addByInsert` call in `CAMTemplateCopier.py` to `True`
-  for a linked reference; Fusion then requires the part and the copy to be in
-  the same project.
+- The part is inserted as a linked reference (`INSERT_AS_REFERENCE = True`
+  in `config.py`). Fusion only links files from the same project; the copy
+  is saved next to the part, so that always holds. Should Fusion still refuse
+  the link, the add-in inserts an embedded copy and tells you. Set the
+  option to `False` to always embed.
+- The copy is opened with the inserted part unsaved; save it when you are
+  happy with it, as you would after inserting by hand.
 - The copy is refused when a file with the same name already exists in the
   target folder.
 - Progress and errors go to the **TEXT COMMANDS** window, prefixed with
