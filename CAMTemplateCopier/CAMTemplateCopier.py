@@ -1,104 +1,180 @@
+# CAMTemplateCopier - Fusion add-in entry point.
+#
+# Fusion calls run() when the add-in loads and stop() when it unloads. The
+# command (toolbar button and dialog) lives in commands/copyTemplate/entry.py.
+# This file owns the two application-level events the copy needs:
+#
+#   1. a custom event, fired from the dialog's OK handler, in which the
+#      template is opened invisibly, saved under the new name into the active
+#      document's folder and closed. Saving or closing a document is not
+#      allowed inside a command event, so it has to happen afterwards;
+#   2. the dataFileComplete event, which fires when the cloud upload of the
+#      new file has finished. The new file is opened there and the original
+#      part is inserted into it.
+#
+# The add-in's own modules are dropped from sys.modules and imported again on
+# every run(), so Stop / Run in the Scripts and Add-Ins dialog picks up edited
+# files without restarting Fusion. Fusion's loader leaves __package__ unset,
+# so the package name is resolved the way a relative import resolves it.
+
+import importlib
+import json
+import sys
+import traceback
+from pathlib import Path
+
 import adsk.core
 import adsk.fusion
-import traceback
-import json
-import os
-import sys
 
-# Ensure the add-in root is on the path
-_addin_dir = os.path.dirname(os.path.abspath(__file__))
-if _addin_dir not in sys.path:
-    sys.path.insert(0, _addin_dir)
-
-import config
-from commands.copyTemplate import entry as copy_template_cmd
-from lib.fusionAddInUtils import log
+_ROOT = Path(__file__).resolve().parent
+_OWN = ('commands', 'lib', 'config.py')
 
 _app = adsk.core.Application.get()
 _ui = _app.userInterface
 
-# Global references to prevent garbage collection
-_handlers = []
+config = None               # the add-in's config module, set by _load_fresh()
+copy_template_cmd = None    # commands/copyTemplate/entry.py
+_log = None
+
+_handlers = []              # keeps event handlers alive
 _custom_event = None
 _data_file_complete_handler = None
 
-# State for tracking the async save and component insert
+# State of the copy in flight: the name we are waiting for the cloud to
+# report as uploaded, and the part to insert into it once it is open.
 _pending_open_name = None
-_source_data_file = None  # The original part's DataFile to insert after template opens
+_source_data_file = None
 
+
+# ------------------------------------------------------------------ module loading
+
+def _package_name() -> str:
+    g = globals()
+    if g.get('__package__'):
+        return g['__package__']
+    spec = g.get('__spec__')
+    if spec is not None and getattr(spec, 'parent', None):
+        return spec.parent
+    name = g.get('__name__') or ''
+    return name if '__path__' in g else name.rpartition('.')[0]
+
+
+def _is_own(module) -> bool:
+    """Is this module one of the add-in's own (under commands/, lib/, or config.py)?"""
+    paths = []
+    try:
+        f = getattr(module, '__file__', None)
+        if f:
+            paths.append(f)
+        paths.extend(str(p) for p in (getattr(module, '__path__', None) or []))
+    except Exception:
+        return False
+    for p in paths:
+        try:
+            rel = Path(p).resolve().relative_to(_ROOT)
+        except (ValueError, OSError):
+            continue
+        if rel.parts and rel.parts[0] in _OWN:
+            return True
+    return False
+
+
+def _drop_stale_modules() -> None:
+    stale = [name for name, module in list(sys.modules.items())
+             if module is not None and name != __name__ and _is_own(module)]
+    for name in stale:
+        sys.modules.pop(name, None)
+
+
+def _load_fresh() -> None:
+    global config, copy_template_cmd, _log
+    pkg = _package_name()
+    if not pkg:
+        raise ImportError('cannot resolve the add-in package name (no __package__, __spec__ or __path__)')
+    _drop_stale_modules()
+    config = importlib.import_module(pkg + '.config')
+    utils = importlib.import_module(pkg + '.lib.fusionAddInUtils')
+    copy_template_cmd = importlib.import_module(pkg + '.commands.copyTemplate.entry')
+    _log = utils.log
+
+
+def _report(what: str) -> None:
+    """Log a failure and show it, whatever state the add-in is in."""
+    error_msg = traceback.format_exc()
+    try:
+        if _log is not None:
+            _log(f'{what} failed:\n{error_msg}')
+    except Exception:
+        pass
+    try:
+        _ui.messageBox(f'CAMTemplateCopier {what} failed:\n{error_msg}')
+    except Exception:
+        pass
+
+
+# ------------------------------------------------------------------ events
 
 class CopyEventHandler(adsk.core.CustomEventHandler):
-    """Handles the deferred copy operation outside the command transaction.
-
-    This is where the actual open-template -> saveAs -> close sequence happens.
-    """
+    """The deferred copy, outside the command transaction: open the template
+    invisibly, save it under the new name into the target folder, close it.
+    The upload then completes in the background (see DataFileCompleteHandler)."""
 
     def __init__(self):
         super().__init__()
 
     def notify(self, args):
         global _pending_open_name, _source_data_file
+        template_doc = None
         try:
             event_data = json.loads(args.additionalInfo)
-            template_name = event_data["template"]
-            new_name = event_data["newName"]
+            template_name = event_data['template']
+            new_name = event_data['newName']
+            _log(f"Starting copy: '{template_name}' -> '{new_name}'")
 
-            log(f"Starting copy: '{template_name}' -> '{new_name}'")
-
-            # Get the cached template DataFile
-            from commands.copyTemplate.entry import _template_files_cache
-
-            template_file = _template_files_cache.get(template_name)
-            if not template_file:
-                _ui.messageBox(
-                    f'Template "{template_name}" not found in cache.\n'
-                    f"Please try again."
-                )
+            template_file = copy_template_cmd.cached_template(template_name)
+            if template_file is None:
+                _ui.messageBox(f'Template "{template_name}" is no longer available.\nPlease run the command again.')
                 return
 
-            # Get the target folder and save source file ref for later insertion
             active_doc = _app.activeDocument
             if not active_doc or not active_doc.isSaved:
-                _ui.messageBox(
-                    "Cannot determine target folder.\n"
-                    "Make sure a saved document is open."
-                )
+                _ui.messageBox('Cannot determine the target folder.\nMake sure a saved document is open.')
                 return
             target_folder = active_doc.dataFile.parentFolder
 
-            # Only store the source file if the user wants to insert the component
-            if event_data.get("insertComponent", True):
-                _source_data_file = active_doc.dataFile
-            else:
-                _source_data_file = None
+            # The part to insert later, only when asked for.
+            _source_data_file = active_doc.dataFile if event_data.get('insertComponent', True) else None
 
-            # Open the template invisibly
-            log("Opening template document (invisible)...")
+            _log('Opening the template (invisible)...')
             template_doc = _app.documents.open(template_file, False)
             if not template_doc:
-                _ui.messageBox("Failed to open the template document.")
+                _ui.messageBox('Fusion could not open the template document.')
                 return
 
-            # Save as new name into the target folder
-            log(f"Saving as '{new_name}' into '{target_folder.name}'...")
+            _log(f"Saving as '{new_name}' into '{target_folder.name}'...")
             _pending_open_name = new_name
-            template_doc.saveAs(new_name, target_folder, "", "")
-
-            # Close the invisible template document without saving
-            template_doc.close(False)
-            log("Template document closed. Waiting for cloud save to complete...")
-
-        except:
-            error_msg = traceback.format_exc()
-            log(f"Copy failed:\n{error_msg}")
-            _ui.messageBox(f"CAMTemplateCopier copy failed:\n{error_msg}")
+            if not template_doc.saveAs(new_name, target_folder, '', ''):
+                _pending_open_name = None
+                _source_data_file = None
+                _ui.messageBox(f'Fusion could not save "{new_name}" into "{target_folder.name}".')
+                return
+            _log('Saved. Waiting for the cloud upload to complete...')
+        except Exception:
+            _pending_open_name = None
+            _source_data_file = None
+            _report('copy')
+        finally:
+            # Never leave an invisible document open, whatever happened above.
+            if template_doc is not None:
+                try:
+                    template_doc.close(False)
+                except Exception:
+                    _log('Closing the template document raised an exception.')
 
 
 class DataFileCompleteHandler(adsk.core.DataEventHandler):
-    """Fires when a cloud file save completes.
-
-    We use this to open the newly saved copy once it's available.
-    """
+    """Fires when a cloud upload has completed. When it is the file we just
+    saved, open it and insert the original part."""
 
     def __init__(self):
         super().__init__()
@@ -108,99 +184,85 @@ class DataFileCompleteHandler(adsk.core.DataEventHandler):
         try:
             if not _pending_open_name:
                 return
-
             completed_file = args.file
-            if completed_file and completed_file.name == _pending_open_name:
-                log(f"Cloud save complete for '{_pending_open_name}'. Opening...")
-                new_doc = _app.documents.open(completed_file, True)
-                log("New document opened successfully.")
+            if completed_file is None or completed_file.name != _pending_open_name:
+                return
+            _log(f"Upload of '{_pending_open_name}' complete. Opening...")
+            new_doc = _app.documents.open(completed_file, True)
+            if not new_doc:
+                _ui.messageBox(f'"{_pending_open_name}" was saved but Fusion could not open it.')
+                return
+            _log('New document opened.')
 
-                # Insert the original part as a component
-                if _source_data_file and new_doc:
-                    try:
-                        design = adsk.fusion.Design.cast(new_doc.products.itemByProductType("DesignProductType"))
-                        if design:
-                            root_comp = design.rootComponent
-                            transform = adsk.core.Matrix3D.create()  # identity — origin
-                            root_comp.occurrences.addByInsert(
-                                _source_data_file, transform, False
-                            )
-                            log(f"Inserted component '{_source_data_file.name}' into template.")
-                        else:
-                            log("Warning: No design found in new document. Component not inserted.")
-                    except:
-                        error_msg = traceback.format_exc()
-                        log(f"Component insert failed:\n{error_msg}")
-                        _ui.messageBox(
-                            f"Template copied and opened, but component insert failed:\n{error_msg}"
-                        )
-
-                _pending_open_name = None
-                _source_data_file = None
-
-        except:
-            error_msg = traceback.format_exc()
-            log(f"DataFileComplete handler error:\n{error_msg}")
+            if _source_data_file is not None:
+                try:
+                    design = adsk.fusion.Design.cast(new_doc.products.itemByProductType('DesignProductType'))
+                    if design:
+                        transform = adsk.core.Matrix3D.create()      # identity: at the origin
+                        design.rootComponent.occurrences.addByInsert(_source_data_file, transform, False)
+                        _log(f"Inserted '{_source_data_file.name}' into the new document.")
+                    else:
+                        _log('No design in the new document; the part was not inserted.')
+                except Exception:
+                    error_msg = traceback.format_exc()
+                    _log(f'Component insert failed:\n{error_msg}')
+                    _ui.messageBox(f'The template was copied and opened, but inserting the part failed:\n{error_msg}')
+        except Exception:
+            _report('open after upload')
+        finally:
             _pending_open_name = None
             _source_data_file = None
 
 
+# ------------------------------------------------------------------ add-in lifecycle
+
 def run(context):
     global _custom_event, _data_file_complete_handler
     try:
-        log("Starting CAMTemplateCopier add-in...")
+        _load_fresh()
+        _log('Starting CAMTemplateCopier add-in...')
 
-        # Register the custom event for deferred save operations
+        # A previous load that did not stop cleanly leaves the id registered,
+        # and registerCustomEvent then returns None.
+        try:
+            _app.unregisterCustomEvent(config.CUSTOM_EVENT_ID)
+        except Exception:
+            pass
         custom_event = _app.registerCustomEvent(config.CUSTOM_EVENT_ID)
+        if custom_event is None:
+            raise RuntimeError(f'registerCustomEvent({config.CUSTOM_EVENT_ID!r}) returned None')
         copy_handler = CopyEventHandler()
         custom_event.add(copy_handler)
         _handlers.append(copy_handler)
         _custom_event = custom_event
 
-        # Register the dataFileComplete event to know when cloud saves finish
         dfc_handler = DataFileCompleteHandler()
         _app.dataFileComplete.add(dfc_handler)
         _handlers.append(dfc_handler)
         _data_file_complete_handler = dfc_handler
 
-        # Start the command (creates the toolbar button)
         copy_template_cmd.start(_handlers)
-
-        log("CAMTemplateCopier add-in started.")
-
-    except:
-        error_msg = traceback.format_exc()
-        log(f"CAMTemplateCopier run failed:\n{error_msg}")
-        if _ui:
-            _ui.messageBox(f"CAMTemplateCopier failed to start:\n{error_msg}")
+        _log('CAMTemplateCopier add-in started.')
+    except Exception:
+        _report('run')
 
 
 def stop(context):
-    global _custom_event, _data_file_complete_handler, _pending_open_name
+    global _custom_event, _data_file_complete_handler, _pending_open_name, _source_data_file
     try:
-        log("Stopping CAMTemplateCopier add-in...")
-
-        # Stop the command (removes toolbar button)
+        if copy_template_cmd is None:        # run() never got that far
+            return
+        _log('Stopping CAMTemplateCopier add-in...')
         copy_template_cmd.stop()
-
-        # Unregister the custom event
-        if _custom_event:
+        if _custom_event is not None:
             _app.unregisterCustomEvent(config.CUSTOM_EVENT_ID)
             _custom_event = None
-
-        # Clean up the dataFileComplete handler
-        if _data_file_complete_handler:
+        if _data_file_complete_handler is not None:
             _app.dataFileComplete.remove(_data_file_complete_handler)
             _data_file_complete_handler = None
-
         _handlers.clear()
         _pending_open_name = None
         _source_data_file = None
-
-        log("CAMTemplateCopier add-in stopped.")
-
-    except:
-        error_msg = traceback.format_exc()
-        log(f"CAMTemplateCopier stop failed:\n{error_msg}")
-        if _ui:
-            _ui.messageBox(f"CAMTemplateCopier failed to stop:\n{error_msg}")
+        _log('CAMTemplateCopier add-in stopped.')
+    except Exception:
+        _report('stop')
